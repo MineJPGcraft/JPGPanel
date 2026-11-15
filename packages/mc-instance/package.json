@@ -1,0 +1,31 @@
+{
+  "name": "@jpgpanel/mc-instance",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "dev": "src/index.ts",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "../../../../node_modules/.bin/tsc -p tsconfig.json && ../../../../node_modules/.bin/vite build"
+  },
+  "dependencies": {
+    "@jpgpanel/server-instances": "workspace:*",
+    "@mirelia/database-core": "workspace:*"
+  },
+  "peerDependencies": {
+    "yumeri": "^3.1.4"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.0.1",
+    "react": "^19.2.6",
+    "vite": "^8.0.12"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  }
+}
