@@ -51,10 +51,10 @@ function publicType(type: InstanceTypeDefinition, specs: InstanceSpecView[]): In
   };
 }
 
-function decorate(row: InstanceRow, spec?: InstanceSpec, config: InstanceConfigValues = {}): Instance {
+function decorate(row: InstanceRow, spec?: InstanceSpec, config: InstanceConfigValues = {}, projectName?: string): Instance {
   let attributes: Record<string, unknown> = {};
   try { const parsed = JSON.parse(row.attributes_json || "{}"); attributes = object(parsed); } catch { attributes = {}; }
-  return { ...row, attributes, config, spec };
+  return { ...row, attributes, config, spec, projectName };
 }
 
 export async function apply(ctx: Context, pluginConfig: InstanceConfig = defaultRuntime()) {
@@ -252,6 +252,12 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
   }
 
   /** Stored configuration merged over the type's schema defaults. */
+  /** Project name for an instance, used by the grouped list. */
+  async function projectNameOf(projectId: number) {
+    const project = await db.selectOne("projects", { id: projectId }) as { name?: string } | undefined;
+    return project?.name ?? `#${projectId}`;
+  }
+
   async function storedConfig(row: InstanceRow) {
     const definition = typeOf(row);
     return definition ? mergeConfig(definition.configSchema, parseConfig(row)) : parseConfig(row);
@@ -385,7 +391,7 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
       for (const row of rows) {
         const runtime = runtimes.get(row.instance_id);
         const status: InstancePowerState = runtime?.running ? "running" : (row.status === "running" ? "stopped" : row.status);
-        output.push(decorate({ ...row, status }, row.spec_id ? specsById.get(row.spec_id) : undefined, await storedConfig(row)));
+        output.push(decorate({ ...row, status }, row.spec_id ? specsById.get(row.spec_id) : undefined, await storedConfig(row), await projectNameOf(row.project_id)));
       }
       return output;
     },
@@ -552,7 +558,22 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
   ctx.route("/api/instances").methods("GET").action(async (session) => {
     const user = await users.current(session);
     if (!user) return fail(session, 401, "instances.errors.auth");
-    session.respond({ instances: await service.listForUser(user), types: service.listTypes() }, "json");
+    session.respond({ instances: await service.listForUser(user), types: await typeCatalog() }, "json");
+  });
+
+  /** Instances of one project, shown on the project instance page. */
+  ctx.route("/api/projects/:id/instances").methods("GET").action(async (session, _query, id) => {
+    const access = await projectService.authorize(session, id, "view");
+    if (!access?.project.id) return fail(session, 404, "instances.errors.notFound");
+    const rows = await db.select("instances", { project_id: access.project.id }) as InstanceRow[];
+    const specsById = new Map((await specs()).map((spec) => [spec.id, spec]));
+    const output = [];
+    for (const row of rows) {
+      const runtime = runtimes.get(row.instance_id);
+      const status: InstancePowerState = runtime?.running ? "running" : (row.status === "running" ? "stopped" : row.status);
+      output.push(decorate({ ...row, status }, row.spec_id ? specsById.get(row.spec_id) : undefined, await storedConfig(row), access.project.name));
+    }
+    session.respond({ instances: output.sort((a, b) => b.created_at.localeCompare(a.created_at)), canManage: access.permissions.includes("manage_products") }, "json");
   });
 
   ctx.route("/api/instances/:id").methods("GET").action(async (session, _query, id) => {
@@ -715,6 +736,68 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
     }
   });
 
+  /**
+   * Interactive terminal over a pseudo terminal. The browser posts keystrokes and tails
+   * `/api/instances/:id/terminal/output`; the session lives in the runtime, so it keeps
+   * running while the page is closed.
+   */
+  ctx.route("/api/instances/:id/terminal/start").methods("POST").action(async (session, _query, id) => {
+    const instance = await service.authorize(session, id);
+    if (!instance) return;
+    const body = object(await session.parseRequestBody());
+    const definition = typeOf(instance as InstanceRow);
+    if (definition?.terminal === false) return fail(session, 409, "instances.errors.noTerminal");
+    const runtime = runtimeFor(instance);
+    const terminalId = `tty_${randomBytes(4).toString("hex")}`;
+    const directory = path.join(root, instance.instance_id);
+    try {
+      runtime.openTerminal(terminalId, {
+        cols: Number(body.cols ?? 120), rows: Number(body.rows ?? 32),
+        cwd: definition?.terminalWorkdir ? path.join(directory, definition.terminalWorkdir) : path.join(directory, "server"),
+      });
+    } catch (error) {
+      return fail(session, 502, "instances.errors.console", { detail: error instanceof Error ? error.message : String(error) });
+    }
+    session.respond({ terminalId, shell: process.env.SHELL ?? "/bin/bash" }, "json");
+  });
+
+  ctx.route("/api/instances/:id/terminal/input").methods("POST").action(async (session, _query, id) => {
+    const instance = await service.authorize(session, id);
+    if (!instance) return;
+    const body = object(await session.parseRequestBody());
+    try {
+      runtimeFor(instance).writeTerminal(String(body.terminalId ?? ""), String(body.data ?? "").slice(0, 8192));
+      session.respond({ ok: true }, "json");
+    } catch {
+      fail(session, 409, "instances.errors.terminalStopped");
+    }
+  });
+
+  ctx.route("/api/instances/:id/terminal/output").methods("GET").action(async (session, query, id) => {
+    const instance = await service.authorize(session, id);
+    if (!instance) return;
+    const runtime = runtimeFor(instance);
+    const response = session.client.res;
+    if (!response) return fail(session, 500, "instances.errors.console");
+    response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", connection: "keep-alive", "x-accel-buffering": "no" });
+    // The stream owns the response from here on; the framework must not finalise it.
+    session.responseHandled = true;
+    const send = (chunk: string) => response.write(`data: ${JSON.stringify({ data: chunk })}\n\n`);
+    const unsubscribe = runtime.onOutput(send);
+    const heartbeat = setInterval(() => response.write(": keep-alive\n\n"), 15_000);
+    void query;
+    const close = () => { clearInterval(heartbeat); unsubscribe(); response.end(); };
+    session.client.req?.on("close", close);
+  });
+
+  ctx.route("/api/instances/:id/terminal/close").methods("POST").action(async (session, _query, id) => {
+    const instance = await service.authorize(session, id);
+    if (!instance) return;
+    const body = object(await session.parseRequestBody());
+    runtimeFor(instance).closeTerminal(String(body.terminalId ?? ""));
+    session.respond({ ok: true }, "json");
+  });
+
   ctx.route("/api/instances/:id/console").methods("GET").action(async (session, query, id) => {
     const instance = await service.authorize(session, id);
     if (!instance) return;
@@ -731,6 +814,8 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
     const response = session.client.res;
     if (!response) return fail(session, 500, "instances.errors.console");
     response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", connection: "keep-alive", "x-accel-buffering": "no" });
+    // The stream owns the response from here on; the framework must not finalise it.
+    session.responseHandled = true;
     const send = (payload: unknown) => response.write(`data: ${JSON.stringify(payload)}\n\n`);
     for (const line of runtime.tail(Number(query.get("after") ?? 0) || 0)) send(line);
     const unsubscribe = runtime.subscribe(send);
@@ -807,7 +892,13 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
   void syncStore().catch(() => undefined);
 
   ctx.i18n({ cloud: { instances: {
-    nav: { section: { zh: "实例", en: "Instances", ja: "インスタンス" }, instances: { zh: "我的实例", en: "Instances", ja: "インスタンス" }, specs: { zh: "实例规格", en: "Specifications", ja: "インスタンス仕様" } },
+    nav: {
+      section: { zh: "实例", en: "Instances", ja: "インスタンス" }, instances: { zh: "全部实例", en: "All instances", ja: "すべてのインスタンス" },
+      overview: { zh: "概览", en: "Overview", ja: "概要" }, console: { zh: "控制台", en: "Console", ja: "コンソール" },
+      terminal: { zh: "终端", en: "Terminal", ja: "ターミナル" }, config: { zh: "配置", en: "Configuration", ja: "設定" },
+      files: { zh: "文件", en: "Files", ja: "ファイル" }, tools: { zh: "类型工具", en: "Type tools", ja: "種別ツール" },
+      specs: { zh: "实例规格", en: "Specifications", ja: "インスタンス仕様" },
+    },
     title: { zh: "我的实例", en: "My instances", ja: "インスタンス一覧" },
     description: { zh: "管理分配给您的服务器实例：启动、停止、查看终端与配置。", en: "Manage the server instances assigned to you: start, stop, open the terminal and configure them.", ja: "割り当てられたサーバーインスタンスを管理します：起動、停止、ターミナル、設定。" },
     empty: { zh: "还没有实例，先到商城购买一个吧。", en: "No instances yet. Buy one from the store first.", ja: "インスタンスはまだありません。ストアで購入してください。" },
@@ -827,13 +918,21 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
       overview: { zh: "概览", en: "Overview", ja: "概要" },
       console: { zh: "终端", en: "Terminal", ja: "ターミナル" },
       activity: { zh: "操作记录", en: "Activity", ja: "操作履歴" },
-      connect: { zh: "连接地址", en: "Address", ja: "接続先" },
+      address: { zh: "连接地址", en: "Address", ja: "接続先" },
       commandPlaceholder: { zh: "输入命令并按回车，例如 stop", en: "Type a command and press enter, e.g. stop", ja: "コマンドを入力して Enter（例: stop）" },
       send: { zh: "发送", en: "Send", ja: "送信" },
       clear: { zh: "清空", en: "Clear", ja: "クリア" },
       stoppedHint: { zh: "实例已停止，启动后可输入命令。", en: "The instance is stopped. Start it to send commands.", ja: "インスタンスは停止中です。起動するとコマンドを送信できます。" },
       noLines: { zh: "暂无输出", en: "No output yet", ja: "出力はありません" },
       lastError: { zh: "最近错误", en: "Last error", ja: "最新のエラー" },
+      terminalHint: { zh: "基于伪终端的交互式 shell", en: "Interactive shell over a pseudo terminal", ja: "疑似端末上の対話シェル" },
+      terminalIdle: { zh: "尚未连接终端，点击「连接」开始", en: "No terminal session yet. Press Connect.", ja: "ターミナル未接続です。「接続」を押してください。" },
+      connect: { zh: "连接", en: "Connect", ja: "接続" },
+      connecting: { zh: "正在连接…", en: "Connecting…", ja: "接続中…" },
+      disconnect: { zh: "断开", en: "Disconnect", ja: "切断" },
+      terminalKeys: { zh: "支持方向键历史、Tab 补全、Ctrl+C 中断、Ctrl+L 清屏。", en: "Arrow-key history, Tab completion, Ctrl+C to interrupt, Ctrl+L to clear.", ja: "矢印キーの履歴、Tab 補完、Ctrl+C 中断、Ctrl+L クリア。" },
+      typeTools: { zh: "该实例类型提供的工具", en: "Tools provided by this instance type", ja: "この種別が提供するツール" },
+      openProject: { zh: "查看项目", en: "Open project", ja: "プロジェクトを開く" },
     },
     admin: {
       title: { zh: "实例规格", en: "Instance specifications", ja: "インスタンス仕様" },
@@ -903,6 +1002,7 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
       power: { zh: "实例操作失败", en: "The instance operation failed", ja: "インスタンス操作に失敗しました" },
       terminalStopped: { zh: "实例已停止，无法发送命令", en: "The instance is stopped; commands cannot be sent", ja: "インスタンスは停止中のためコマンドを送信できません" },
       console: { zh: "无法打开终端", en: "Could not open the terminal", ja: "ターミナルを開けません" },
+      noTerminal: { zh: "该实例类型不提供终端", en: "This instance type has no terminal", ja: "この種別はターミナルを提供しません" },
       spec: { zh: "规格数据无效", en: "Invalid specification", ja: "仕様データが無効です" },
       specInUse: { zh: "该规格已有实例，不能删除", en: "This specification is used by instances and cannot be deleted", ja: "この仕様は使用中のため削除できません" },
     },

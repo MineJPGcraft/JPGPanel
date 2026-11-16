@@ -17,6 +17,3 @@ export function InstanceFileSlot({ instanceId }: { instanceId: string }) {
 }
 
 export type { InstancePanelProps };
-
-/** Built-in reference panel for the `minecraft` type shipped by mc-instance. */
-export { default as MinecraftPanel } from "./pages/MinecraftPanel";

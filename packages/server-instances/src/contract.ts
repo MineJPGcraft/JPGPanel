@@ -231,6 +231,10 @@ export interface InstanceTypeDefinition {
    * or `whitelist add`. Return `false` to forward the line to the process.
    */
   commands?: Array<{ name: string; description: string; run(instance: Instance, argument: string, user: User, provisioner: InstanceProvisioner): Promise<string | undefined> }>;
+  /** Whether the panel offers an interactive shell (default true). */
+  terminal?: boolean;
+  /** Working directory of the shell, relative to the instance directory. */
+  terminalWorkdir?: string;
 }
 
 export interface InstanceTypeView extends Omit<InstanceTypeDefinition, "create" | "destroy" | "onPower" | "routes" | "applyConfig" | "describe" | "downloads" | "variants" | "resolveInstall"> {
@@ -295,6 +299,8 @@ export interface Instance extends InstanceRow {
   attributes: Record<string, unknown>;
   config: InstanceConfigValues;
   spec?: InstanceSpec;
+  /** Name of the owning project, filled in by the list endpoints. */
+  projectName?: string;
 }
 
 export interface InstanceSpecView extends InstanceSpec {

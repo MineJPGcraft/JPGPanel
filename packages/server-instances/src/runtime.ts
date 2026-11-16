@@ -22,7 +22,10 @@ export class InstanceRuntime {
   private child?: ChildProcess;
   private seq = 0;
   private listeners = new Set<Listener>();
+  private raw = new Set<(chunk: string) => void>();
   private stopping = false;
+  /** Children started under a pseudo terminal (shell sessions). */
+  private terminals = new Map<string, ChildProcess>();
 
   constructor(
     readonly instanceId: string,
@@ -47,8 +50,16 @@ export class InstanceRuntime {
   }
 
   private attach(child: ChildProcess) {
-    child.stdout?.on("data", (chunk: Buffer) => this.push("stdout", chunk.toString("utf8")));
-    child.stderr?.on("data", (chunk: Buffer) => this.push("stderr", chunk.toString("utf8")));
+    child.stdout?.on("data", (chunk: Buffer) => {
+      const text = chunk.toString("utf8");
+      for (const listener of this.raw) listener(text);
+      this.push("stdout", text);
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      const text = chunk.toString("utf8");
+      for (const listener of this.raw) listener(text);
+      this.push("stderr", text);
+    });
     child.on("error", (error) => this.push("system", `process error: ${error.message}`));
     child.on("exit", (code, signal) => {
       this.push("system", `process exited (code=${code ?? "null"}, signal=${signal ?? "none"})`);
@@ -103,6 +114,70 @@ export class InstanceRuntime {
     setTimeout(() => { if (this.child === child) { this.push("system", "killing instance after grace period"); child.kill("SIGKILL"); } }, graceMs).unref?.();
   }
 
+  /**
+   * Open an interactive terminal. `script` allocates a pseudo terminal so the child
+   * believes it is attached to a tty; resize requests are forwarded when `stty` is
+   * available, and the session ends when the process exits or `closeTerminal` runs.
+   */
+  openTerminal(id: string, options: { shell?: string; cols?: number; rows?: number; cwd?: string } = {}) {
+    this.closeTerminal(id);
+    const shell = options.shell || process.env.SHELL || "/bin/bash";
+    const cols = Math.max(20, Math.min(options.cols ?? 120, 400));
+    const rows = Math.max(5, Math.min(options.rows ?? 32, 200));
+    const cwd = options.cwd ?? this.cwd;
+    mkdirSync(cwd, { recursive: true });
+    // `script -qfec <cmd> /dev/null` gives the child a pty; TERM keeps colours working.
+    const child = spawn("script", ["-qfec", shell, "/dev/null"], {
+      cwd,
+      env: {
+        ...process.env,
+        TERM: "xterm-256color", COLUMNS: String(cols), LINES: String(rows),
+        PS1: "\\u@\\h:\\w\\$ ", HISTFILE: path.join(cwd, ".bash_history"),
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    this.terminals.set(id, child);
+    const forward = (chunk: Buffer) => { for (const listener of this.raw) listener(chunk.toString("utf8")); };
+    child.stdout?.on("data", forward);
+    child.stderr?.on("data", forward);
+    child.on("exit", (code) => {
+      this.terminals.delete(id);
+      for (const listener of this.raw) listener(`\r\n[session closed, exit ${code ?? 0}]\r\n`);
+    });
+    this.resizeTerminal(id, cols, rows);
+    return child;
+  }
+
+  writeTerminal(id: string, data: string) {
+    const child = this.terminals.get(id);
+    if (!child?.stdin) throw new Error("terminal is not open");
+    child.stdin.write(data);
+  }
+
+  resizeTerminal(id: string, cols: number, rows: number) {
+    const child = this.terminals.get(id);
+    if (!child?.pid) return;
+    // The pty lives in the `script` child; stty on its controlling terminal resizes it.
+    spawnSync("stty", ["cols", String(Math.max(20, Math.min(cols, 400))), "rows", String(Math.max(5, Math.min(rows, 200)))], {
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+    void child;
+  }
+
+  closeTerminal(id: string) {
+    const child = this.terminals.get(id);
+    if (!child) return;
+    this.terminals.delete(id);
+    child.kill("SIGHUP");
+    child.kill("SIGTERM");
+  }
+
+  /** Subscribe to raw terminal output (pty sessions and process stdout). */
+  onOutput(listener: (chunk: string) => void) {
+    this.raw.add(listener);
+    return () => { this.raw.delete(listener); };
+  }
+
   tail(after = 0): TerminalLine[] {
     return this.buffer.filter((line) => line.seq > after);
   }
@@ -112,7 +187,10 @@ export class InstanceRuntime {
     return () => { this.listeners.delete(listener); };
   }
 
-  dispose() { this.stop(1000); }
+  dispose() {
+    for (const id of [...this.terminals.keys()]) this.closeTerminal(id);
+    this.stop(1000);
+  }
 }
 
 /** Directory layout for every instance: data/<instanceId>/{server,snapshots,config}. */

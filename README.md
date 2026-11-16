@@ -48,6 +48,13 @@ The framework owns everything that is the same for every kind of server:
 * **Lifecycle and console** — start/stop run a supervised process owned by the
   instance type; stdout/stderr are kept in a bounded buffer and streamed to the
   browser over server-sent events, and console commands are written to stdin.
+* **Terminal** — an interactive shell over a pseudo terminal (`script` on Linux), so
+  programs that require a tty (top, vim, installers) behave normally. Sessions live in
+  the runtime and survive page reloads; keystrokes post to the API and raw output is
+  streamed back.
+* **Instance pages** — instances belong to projects, so the list groups by project and
+  every instance has its own sidebar: overview, console, terminal, configuration,
+  files and the type's own tools.
 * **Configuration schema** — an instance type describes every knob as a JSON-Schema
   subset (`configSchema`). The panel renders the form generically, validates and merges
   values over defaults, stores them per instance and calls the type's `applyConfig`
