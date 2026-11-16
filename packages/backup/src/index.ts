@@ -2,8 +2,9 @@ import { Context, Logger, Schema } from "yumeri";
 import type { InstanceService } from "@jpgpanel/server-instances";
 import "@jpgpanel/server-instances";
 
-// file-manager provides the archive helpers, so it must be loaded first.
-export const depend = ["file-manager", "instances"];
+// `files` is the component file-manager registers; loaders resolve depend by component
+// name, so it must be that and not the package name.
+export const depend = ["database", "files", "instances"];
 export const provide: string[] = [];
 
 /**
