@@ -79,6 +79,35 @@ export interface InstanceDownloadSource {
   list(instance: Instance): Promise<InstanceRemoteFile[]>;
 }
 
+/**
+ * One installable option of an instance type, for example "Paper 1.21.4" or
+ * "Spigot 1.20.1". Variants come from the type plugin; administrators decide which
+ * ones to sell and at which price.
+ */
+export interface InstanceVariant {
+  id: string;
+  title: string;
+  /** Grouping in the picker, for example "plugins" or "modded". */
+  group?: string;
+  description?: string;
+  /** Version label shown under the title. */
+  version?: string;
+  /** Marks the recommended variant of its group. */
+  recommended?: boolean;
+  /** Extra install parameters, stored with the instance and passed to the type. */
+  parameters?: Record<string, string>;
+}
+
+/** How a variant is installed, resolved by the type plugin. */
+export interface InstanceInstallSource {
+  /** Download URL of the install artifact. */
+  url: string;
+  /** File name relative to the instance directory; defaults to the type's own choice. */
+  target?: string;
+  /** Extra facts for the type. */
+  meta?: Record<string, unknown>;
+}
+
 /** A value the buyer picks before an instance of the type is created. */
 export interface InstanceOption {
   key: string;
@@ -112,6 +141,8 @@ export interface InstanceCreateRequest {
   user: User;
   tenantId: number;
   project: { id: number; name: string };
+  /** Variant chosen at purchase time, from the plugin's variant list. */
+  variant: InstanceVariant;
   /** Values validated against the offer options. */
   selections: Record<string, string | number | boolean>;
   /** Configuration values pre-filled at purchase time (server edition, version, port …). */
@@ -159,7 +190,17 @@ export interface InstanceTypeDefinition {
   name: string;
   description?: string;
   pluginId: string;
+  /** Short label under the type name on the type picker, e.g. "纯净/插件服". */
+  tagline?: string;
+  /** Emoji or image URL shown on the type card. */
+  icon?: string;
+  /** Default per-month price of an instance; the administrator overrides it per spec. */
+  basePriceCents?: number;
   offer: InstanceTypeOffer;
+  /** Installable options this type can create. Empty means a single implicit variant. */
+  variants?(context: { instance?: Instance; values?: InstanceConfigValues }): Promise<InstanceVariant[]> | InstanceVariant[];
+  /** Resolve where a variant is downloaded from; the panel shows the URL in the install log. */
+  resolveInstall?(variant: InstanceVariant, context: { instance?: Instance; values?: InstanceConfigValues }): Promise<InstanceInstallSource | undefined>;
   /** Every knob the panel lets the owner tune; stored per instance. */
   configSchema: InstanceConfigSchema;
   /** Files the panel shows in the file manager, relative to the instance directory. */
@@ -192,11 +233,13 @@ export interface InstanceTypeDefinition {
   commands?: Array<{ name: string; description: string; run(instance: Instance, argument: string, user: User, provisioner: InstanceProvisioner): Promise<string | undefined> }>;
 }
 
-export interface InstanceTypeView extends Omit<InstanceTypeDefinition, "create" | "destroy" | "onPower" | "routes" | "applyConfig" | "describe" | "downloads"> {
+export interface InstanceTypeView extends Omit<InstanceTypeDefinition, "create" | "destroy" | "onPower" | "routes" | "applyConfig" | "describe" | "downloads" | "variants" | "resolveInstall"> {
   routeCount: number;
   downloadSources: Array<{ id: string; title: string }>;
   /** Specs the administrator published for this type. */
   specs: InstanceSpecView[];
+  /** Variants currently offered by the plugin. */
+  variants: InstanceVariant[];
 }
 
 /* ------------------------------------------------------------------ *
@@ -207,6 +250,8 @@ export interface InstanceSpec {
   id?: number;
   slug: string;
   type_id: string;
+  /** Variant this spec sells; empty means the type's default variant. */
+  variant_id: string;
   name: string;
   cpu: number;
   memory_mb: number;
@@ -219,6 +264,7 @@ export interface InstanceSpec {
 }
 
 export interface InstanceRow {
+  variant_id?: string;
   id?: number;
   instance_id: string;
   tenant_id: number;
@@ -275,6 +321,8 @@ export interface InstanceService {
   registerType(definition: InstanceTypeDefinition): () => void;
   listTypes(): InstanceTypeView[];
   findType(typeId: string): InstanceTypeView | undefined;
+  /** Variants of a type, as offered by its plugin right now. */
+  listVariants(typeId: string): Promise<InstanceVariant[]>;
   /* Specification catalogue (administrator managed). */
   listSpecs(): Promise<InstanceSpecView[]>;
   createSpec(input: Partial<InstanceSpec>): Promise<InstanceSpecView>;

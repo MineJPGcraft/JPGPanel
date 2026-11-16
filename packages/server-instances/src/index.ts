@@ -13,7 +13,7 @@ import {
   config as contractConfig, depend, provide,
   type Instance, type InstanceConfig, type InstanceCreation, type InstanceEventRow, type InstanceEventType,
   type InstanceOption, type InstancePowerState, type InstanceProvisioner, type InstanceRow, type InstanceService,
-  type InstanceSpec, type InstanceSpecView, type InstanceConfigSchema, type InstanceConfigValues,
+  type InstanceSpec, type InstanceSpecView, type InstanceConfigSchema, type InstanceConfigValues, type InstanceVariant,
   type InstanceTypeDefinition, type InstanceTypeView,
 } from "./contract.js";
 import {
@@ -27,7 +27,8 @@ export type {
   Instance, InstanceConfig, InstanceCreation, InstanceEventRow, InstanceEventType, InstanceOption, InstancePowerState,
   InstanceCreateRequest, InstanceProvisioner, InstanceRow, InstanceService, InstanceSpec, InstanceSpecView,
   InstanceConfigField, InstanceConfigSchema, InstanceConfigSection, InstanceConfigValues, InstanceFileTrack,
-  InstanceDownloadSource, InstanceRemoteFile, InstanceTypeDefinition, InstanceTypeOffer, InstanceTypeView, TerminalLine,
+  InstanceDownloadSource, InstanceRemoteFile, InstanceInstallSource, InstanceVariant,
+  InstanceTypeDefinition, InstanceTypeOffer, InstanceTypeView, TerminalLine,
 } from "./contract.js";
 export { mergeConfig, schemaDefaults } from "./config.js";
 export type { InstanceRuntime } from "./runtime.js";
@@ -43,7 +44,8 @@ function defaultRuntime(): InstanceConfig { return { publicUrl: "http://localhos
 function publicType(type: InstanceTypeDefinition, specs: InstanceSpecView[]): InstanceTypeView {
   return {
     id: type.id, name: type.name, description: type.description, pluginId: type.pluginId, offer: type.offer,
-    configSchema: type.configSchema, files: type.files ?? [],
+    tagline: type.tagline, icon: type.icon, basePriceCents: type.basePriceCents,
+    configSchema: type.configSchema, files: type.files ?? [], variants: [],
     downloadSources: (type.downloads ?? []).map((source) => ({ id: source.id, title: source.title })),
     routeCount: type.routes?.length ?? 0, specs,
   };
@@ -74,6 +76,7 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
     owner_user_id: { type: "integer", nullable: false },
     spec_id: { type: "integer", initial: 0, nullable: false },
     type_id: { type: "string", nullable: false },
+    variant_id: { type: "string", initial: "", nullable: false },
     plugin_id: { type: "string", nullable: false },
     name: { type: "string", nullable: false },
     provider_ref: { type: "string", initial: "", nullable: false },
@@ -96,6 +99,7 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
     id: { type: "integer", autoIncrement: true },
     slug: { type: "string", nullable: false },
     type_id: { type: "string", nullable: false },
+    variant_id: { type: "string", initial: "", nullable: false },
     name: { type: "string", nullable: false },
     cpu: { type: "integer", initial: 1, nullable: false },
     memory_mb: { type: "integer", initial: 1024, nullable: false },
@@ -154,6 +158,24 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
     return { ...spec, instances: instances.length };
   }
 
+  /** Variants a type offers; a type without a variant list sells one entry. */
+  async function variantsOf(type: InstanceTypeDefinition, context: { instance?: Instance; values?: InstanceConfigValues } = {}): Promise<InstanceVariant[]> {
+    const list = type.variants ? await type.variants(context) : [];
+    if (!list.length) return [{ id: "", title: type.name, description: type.description }];
+    return list.map((variant) => ({ ...variant, id: String(variant.id) })).filter((variant) => variant.id);
+  }
+
+  async function variantOf(type: InstanceTypeDefinition, id: string): Promise<InstanceVariant | undefined> {
+    const list = await variantsOf(type);
+    return list.find((variant) => variant.id === id && id !== "") ?? list.find((variant) => variant.id === "") ?? list[0];
+  }
+
+  /** Stable variant order for the store option list. */
+  function variantList(variants: InstanceVariant[]) {
+    return variants.filter((variant) => variant.id)
+      .sort((a, b) => (a.group ?? "").localeCompare(b.group ?? "") || Number(Boolean(b.recommended)) - Number(Boolean(a.recommended)) || a.title.localeCompare(b.title));
+  }
+
   /** Push every enabled spec into the store as a product of its instance type. */
   let storeSyncGeneration = 0;
   async function syncStore() {
@@ -170,6 +192,8 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
       if (!type) continue;
       if (generation !== storeSyncGeneration) return;
       const cheapest = group.reduce((best, spec) => spec.price_cents < best.price_cents ? spec : best, group[0]);
+      let variants: InstanceVariant[] = [];
+      try { variants = variantList(await variantsOf(type)); } catch { variants = []; }
       try {
         store.registerProduct("server-instances", {
           id: `type-${typeId}`,
@@ -186,8 +210,10 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
           popular: type.offer.popular === true,
           highlights: type.offer.highlights ?? [],
           price: (selections) => {
-            const chosen = group.find((spec) => String(spec.id) === String(selections.spec));
-            return chosen?.price_cents ?? cheapest.price_cents;
+            const wanted = String(selections.variant ?? "").trim();
+            const candidates = group.filter((spec) => !wanted || !spec.variant_id || spec.variant_id === wanted);
+            const chosen = candidates.find((spec) => String(spec.id) === String(selections.spec)) ?? candidates[0] ?? cheapest;
+            return chosen.price_cents;
           },
           fields: [
             {
@@ -198,6 +224,10 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
                 description: `${spec.cpu} vCPU · ${spec.memory_mb} MB RAM${spec.disk_gb ? ` · ${spec.disk_gb} GB disk` : ""}`,
               })),
             },
+            ...(variants.length ? [{
+              key: "variant", label: "Variant", required: true,
+              options: variants.map((entry) => ({ value: entry.id, label: entry.title, description: entry.version ?? entry.description })),
+            }] : []),
             ...(type.offer.options ?? []).map((option) => ({
               key: option.key, label: option.label, type: option.type, required: option.required !== false,
               options: option.type === "select"
@@ -245,6 +275,10 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
     },
 
     listTypes() { return [...types.values()].map((type) => publicType(type, [])); },
+    async listVariants(typeId) {
+      const type = types.get(typeId);
+      return type ? variantsOf(type) : [];
+    },
     findType(typeId) { const type = types.get(typeId); return type ? publicType(type, []) : undefined; },
 
     async listSpecs() {
@@ -254,12 +288,17 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
     async createSpec(input) {
       const type = types.get(String(input.type_id ?? "").trim().toLowerCase());
       if (!type) throw new Error("instance_type_missing");
+      const variantId = String(input.variant_id ?? "").trim();
+      if (variantId) {
+        const known = await variantsOf(type);
+        if (!known.some((variant) => variant.id === variantId)) throw new Error("instance_variant_missing");
+      }
       const name = String(input.name ?? "").trim().slice(0, 80);
       if (!name) throw new Error("instance_spec_name");
       const slug = slugify(String(input.slug ?? name)) || slugify(`${type.id}-${Date.now()}`);
       const now = new Date().toISOString();
       const created = await db.create("instance_specs", {
-        slug, type_id: type.id, name,
+        slug, type_id: type.id, variant_id: variantId, name,
         cpu: Math.max(1, Math.trunc(Number(input.cpu ?? 1))),
         memory_mb: Math.max(128, Math.trunc(Number(input.memory_mb ?? 1024))),
         disk_gb: Math.max(0, Math.trunc(Number(input.disk_gb ?? 10))),
@@ -304,13 +343,14 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
       const now = new Date().toISOString();
       const row = await db.create("instances", {
         instance_id: instanceId, tenant_id: request.tenantId, project_id: request.project.id, owner_user_id: request.user.id!,
-        spec_id: spec.id!, type_id: spec.type_id, plugin_id: definition.pluginId, name: `${definition.name} ${instanceId.slice(-4)}`,
+        spec_id: spec.id!, type_id: spec.type_id, variant_id: request.variant?.id ?? "", plugin_id: definition.pluginId,
+        name: `${definition.name} ${instanceId.slice(-4)}`,
         provider_ref: "", status: "starting", health: "unknown", cpu: spec.cpu, memory_mb: spec.memory_mb, disk_gb: spec.disk_gb,
         port: 0, attributes_json: JSON.stringify({ selections: request.selections }),
         config_json: JSON.stringify(mergeConfig(definition.configSchema, request.config)), order_id: request.orderKey,
         last_error: "", started_at: "", stopped_at: "", created_at: now, updated_at: now,
       }) as InstanceRow;
-      await service.recordEvent(instanceId, "created", `created ${definition.name} with spec ${spec.name}`, request.user);
+      await service.recordEvent(instanceId, "created", `created ${definition.name}${request.variant?.title ? ` (${request.variant.title})` : ""} with spec ${spec.name}`, request.user);
       const provisioner = provisionerFor(row);
       try {
         const created: InstanceCreation = await definition.create(request, provisioner);
@@ -451,8 +491,11 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
       }
       selections[option.key] = option.type === "number" ? Number(raw) : option.type === "boolean" ? raw === "true" : raw;
     }
+    const variantId = String(request.selections.variant ?? spec.variant_id ?? "");
+    const variant = await variantOf(definition, variantId);
+    if (!variant) throw new Error("INSTANCE_VARIANT_MISSING");
     const instance = await service.createInstanceForOrder({
-      user: request.user, tenantId: request.tenant.id!, project: request.project, selections, config: selections,
+      user: request.user, tenantId: request.tenant.id!, project: request.project, selections, variant, config: selections,
       specId, spec: { cpu: spec.cpu, memoryMb: spec.memory_mb, diskGb: spec.disk_gb }, orderKey: request.idempotencyKey,
     });
     return {
@@ -473,10 +516,37 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
     session.respond({ error: session.text(key), ...extra }, "json");
   }
 
+  /** Types as the picker shows them: headline facts plus the variants each offers. */
+  async function typeCatalog() {
+    const allSpecs = await specs();
+    const output = [];
+    for (const type of types.values()) {
+      let variants: InstanceVariant[] = [];
+      try { variants = await variantsOf(type); } catch { variants = []; }
+      const own = allSpecs.filter((spec) => spec.type_id === type.id);
+      output.push({
+        ...publicType(type, []),
+        variants,
+        specs: await Promise.all(own.map((spec) => specView(spec))),
+        basePriceCents: type.basePriceCents ?? Math.min(...own.map((spec) => spec.price_cents), type.offer.priceCents),
+        instances: (await db.select("instances", { type_id: type.id }) as InstanceRow[]).length,
+      });
+    }
+    return output;
+  }
+
   ctx.route("/api/instances/types").methods("GET").action(async (session) => {
     const user = await users.current(session);
     if (!user) return fail(session, 401, "instances.errors.auth");
-    session.respond({ types: service.listTypes() }, "json");
+    session.respond({ types: await typeCatalog() }, "json");
+  });
+
+  /** Variants of one type, for the admin spec form and the picker. */
+  ctx.route("/api/instances/types/:typeId/variants").methods("GET").action(async (session, _query, typeId) => {
+    if (!await requireAdmin(session)) return;
+    const type = types.get(typeId);
+    if (!type) return fail(session, 404, "instances.errors.notFound");
+    session.respond({ type: { id: type.id, name: type.name }, variants: await variantsOf(type) }, "json");
   });
 
   ctx.route("/api/instances").methods("GET").action(async (session) => {
@@ -674,7 +744,7 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
 
   ctx.route("/api/instances/admin/specs").methods("GET").action(async (session) => {
     if (!await requireAdmin(session)) return;
-    session.respond({ specs: await service.listSpecs(), types: service.listTypes() }, "json");
+    session.respond({ specs: await service.listSpecs(), types: await typeCatalog() }, "json");
   });
   ctx.route("/api/instances/admin/specs").methods("POST").action(async (session) => {
     if (!await requireAdmin(session)) return;
@@ -782,6 +852,13 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
       instances: { zh: "实例数", en: "Instances", ja: "インスタンス数" },
       delete: { zh: "删除", en: "Delete", ja: "削除" },
       noTypes: { zh: "还没有插件注册实例类型。", en: "No plugin has registered an instance type yet.", ja: "インスタンス種別を登録したプラグインはありません。" },
+      variants: { zh: "个变体", en: "variants", ja: "バリアント" },
+      variant: { zh: "变体", en: "Variant", ja: "バリアント" },
+      pickType: { zh: "选择实例类型", en: "Choose an instance type", ja: "インスタンス種別を選択" },
+      pickTypeHint: { zh: "每种实例类型由插件提供，例如 Minecraft Java 或 Shell。", en: "Each instance type comes from a plugin, for example Minecraft Java or Shell.", ja: "各インスタンス種別はプラグイン（Minecraft Java、Shell など）が提供します。" },
+      pickVariantHint: { zh: "选择要上架规格的变体（软件与版本）。", en: "Pick the variant (software and version) this specification sells.", ja: "販売するバリアント（ソフトとバージョン）を選択します。" },
+      noVariants: { zh: "该类型当前没有可用变体", en: "This type has no variants right now", ja: "この種別には現在バリアントがありません" },
+      recommended: { zh: "推荐", en: "Recommended", ja: "推奨" },
       empty: { zh: "还没有规格", en: "No specifications yet", ja: "仕様はまだありません" },
       saved: { zh: "规格已保存", en: "Specification saved", ja: "仕様を保存しました" },
       instancesTitle: { zh: "全部实例", en: "All instances", ja: "すべてのインスタンス" },

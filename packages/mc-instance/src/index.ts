@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import "@mirelia/dashboard";
 import type {
   Instance, InstanceConfigSchema, InstanceConfigValues, InstanceCreateRequest, InstanceCreation,
-  InstanceDownloadSource, InstanceProvisioner, InstanceRuntime, InstanceService, InstanceTypeDefinition,
+  InstanceDownloadSource, InstanceProvisioner, InstanceRuntime, InstanceService, InstanceTypeDefinition, InstanceVariant,
 } from "@jpgpanel/server-instances";
 import { mergeConfig } from "@jpgpanel/server-instances";
 import "@jpgpanel/server-instances";
@@ -383,14 +383,101 @@ export async function apply(ctx: Context) {
     },
   ];
 
+  /** Software the plugin can install. Paper-family versions come from PaperMC, Mojang from Mojang. */
+  const softwareGroups: Array<{ id: string; title: string; group: string; recommended?: boolean; feed?: string }> = [
+    { id: "paper", title: "Paper", group: "paper", recommended: true, feed: "paper" },
+    { id: "purpur", title: "Purpur", group: "paper", feed: "purpur" },
+    { id: "folia", title: "Folia", group: "paper", feed: "folia" },
+    { id: "spigot", title: "Spigot", group: "paper" },
+    { id: "vanilla", title: "Mojang", group: "vanilla", feed: "mojang" },
+    { id: "fabric", title: "Fabric", group: "modded" },
+    { id: "forge", title: "Forge", group: "modded" },
+    { id: "purpur-experimental", title: "Purpur (experimental)", group: "experimental", feed: "purpur" },
+  ];
+
+  /** Version list per software, cached briefly so the picker is fast but current. */
+  const versionCache = new Map<string, { at: number; versions: string[] }>();
+  async function versionsFor(software: { id: string; feed?: string }): Promise<string[]> {
+    const feed = software.feed;
+    if (!feed) return [];
+    const cached = versionCache.get(software.id);
+    if (cached && Date.now() - cached.at < 10 * 60 * 1000) return cached.versions;
+    let versions: string[] = [];
+    try {
+      if (feed === "mojang") {
+        const manifest = object(await fetch(VANILLA_MANIFEST).then((response) => response.json()));
+        const entries = Array.isArray(manifest.versions) ? manifest.versions as Array<Record<string, unknown>> : [];
+        versions = entries.filter((entry) => entry.type === "release").slice(0, 20).map((entry) => str(entry.id));
+      } else {
+        const list = await fetch(`https://fill.papermc.io/v3/projects/${feed}/versions`).then((response) => response.ok ? response.json() : undefined).catch(() => undefined);
+        // v3 answers `{ versions: [{ version: { id, support } }] }`.
+        const entries = Array.isArray(list) ? list as Array<Record<string, unknown>> : Array.isArray(object(list).versions) ? object(list).versions as Array<Record<string, unknown>> : [];
+        versions = entries.map((entry) => {
+          const nested = object(entry.version);
+          return str(nested.id ?? entry.version ?? entry.id);
+        }).filter(Boolean).slice(0, 20);
+      }
+    } catch { versions = []; }
+    versionCache.set(software.id, { at: Date.now(), versions });
+    return versions;
+  }
+
   const type: InstanceTypeDefinition = {
     id: "minecraft",
-    name: "Minecraft server",
+    name: "Minecraft Java",
+    tagline: "纯净 / 插件服",
+    icon: "block",
+    basePriceCents: 2000,
     pluginId: "mc-instance",
     description: "Paper, Purpur, Fabric, Forge or vanilla servers with a full MCSM-style configuration panel, console, file manager and backups.",
     configSchema,
     files,
     downloads,
+
+    /** Variants are the server software; the installed version is a spec-level config. */
+    async variants() {
+      const variants: InstanceVariant[] = [];
+      for (const software of softwareGroups) {
+        const versions = await versionsFor(software);
+        if (software.feed && !versions.length) {
+          variants.push({ id: software.id, title: software.title, group: software.group, description: "version list unavailable", recommended: software.recommended });
+          continue;
+        }
+        if (!versions.length) {
+          variants.push({ id: software.id, title: software.title, group: software.group, recommended: software.recommended });
+          continue;
+        }
+        for (const version of versions.slice(0, 3)) {
+          variants.push({
+            id: `${software.id}:${version}`,
+            title: software.title,
+            group: software.group,
+            version,
+            recommended: software.recommended && version === versions[0],
+            parameters: { software: software.id, version },
+          });
+        }
+      }
+      return variants;
+    },
+
+    async resolveInstall(variant) {
+      const software = variant.parameters?.software ?? variant.id.split(":")[0];
+      const version = variant.parameters?.version ?? variant.version ?? DEFAULT_VERSION;
+      if (software === "paper" || software === "purpur" || software === "folia") {
+        const build = await paperBuild(version, software);
+        return { url: build.url, target: "server/server.jar", meta: { software, version, build: build.build } };
+      }
+      if (software === "vanilla") {
+        const build = await vanillaBuild(version);
+        return { url: build.url, target: "server/server.jar", meta: { software, version, sha1: build.sha1 } };
+      }
+      if (software === "fabric") {
+        const build = await fabricLoader(version);
+        return { url: build.url, target: "server/server.jar", meta: { software, version } };
+      }
+      throw new Error(`install source for ${software} is not automated yet; upload a jar and pick "custom"`);
+    },
     offer: {
       id: "minecraft",
       name: "Minecraft server",
@@ -401,28 +488,24 @@ export async function apply(ctx: Context) {
       spec: { cpu: 2, memoryMb: 2048, diskGb: 20 },
       sortOrder: 20,
       highlights: ["Paper / Purpur / Fabric / Vanilla", "Full server.properties editor", "Web console", "Backups"],
-      options: [
-        { key: "serverType", label: "Server software", type: "select", required: true, default: "paper", options: [
-          { value: "paper", label: "Paper", description: "Plugins, optimised" },
-          { value: "purpur", label: "Purpur", description: "Paper fork with extras" },
-          { value: "vanilla", label: "Vanilla" },
-          { value: "fabric", label: "Fabric", description: "Mod loader" },
-        ] },
-        { key: "version", label: "Minecraft version", type: "text", required: true, default: DEFAULT_VERSION },
-      ],
+      // Software and version are chosen through the variant, not as extra store options.
     },
 
     async create(request: InstanceCreateRequest, provisioner: InstanceProvisioner): Promise<InstanceCreation> {
       const directory = provisioner.directory;
       mkdirSync(path.join(directory, "server"), { recursive: true });
       mkdirSync(path.join(directory, "backups"), { recursive: true });
-      const values = mergeConfig(configSchema, request.config);
+      // The variant carries the software and version the buyer picked.
+      const variant = request.variant;
+      const software = str(variant?.parameters?.software, "paper") as InstanceConfigValues[string];
+      const version = str(variant?.parameters?.version ?? variant?.version, DEFAULT_VERSION) as InstanceConfigValues[string];
+      const values = mergeConfig(configSchema, { ...request.config, serverType: software, version });
       const instance = {
         instance_id: provisioner.runtime.instanceId,
         tenant_id: request.tenantId, project_id: request.project.id, owner_user_id: request.user.id ?? 0,
         spec_id: 0, type_id: "minecraft", plugin_id: "mc-instance", name: "", provider_ref: "", status: "starting", health: "unknown",
         cpu: request.spec.cpu, memory_mb: request.spec.memoryMb, disk_gb: request.spec.diskGb ?? 0, port: num(values.serverPort, 25565),
-        attributes_json: "{}", config_json: JSON.stringify(values), order_id: request.orderKey, last_error: "",
+        variant_id: variant?.id ?? "", attributes_json: "{}", config_json: JSON.stringify(values), order_id: request.orderKey, last_error: "",
         started_at: "", stopped_at: "", created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
         attributes: {}, config: values,
       } as unknown as Instance;

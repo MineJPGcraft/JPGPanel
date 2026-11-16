@@ -7,11 +7,28 @@ can be versioned and deployed independently of the cloud core.
 ## Packages
 
 ```text
-server-instances  instance framework: types, specs, lifecycle, console, configuration, store integration
-mc-instance       reference instance type: Minecraft servers (MCSM-scale configuration)
+server-instances  instance framework: types, variants, specs, lifecycle, console, configuration, store
+mc-instance       instance type: Minecraft Java servers (software + version variants)
+shell-instance    instance type: plain shell servers defined by administrators
 file-manager      file browser/editor, uploads and backups for every instance
 backup            scheduled backups driven by each type's autoBackupHours setting
 ```
+
+## Types, variants and specifications
+
+Three levels feed the store:
+
+1. **Type** — registered by a plugin (`minecraft`, `shell`, …). The type picker lists one
+   card per type with its tagline.
+2. **Variant** — the installable option of a type, resolved by the type plugin: server
+   software and version for Minecraft (`paper:1.21.4`), template and image for Shell.
+   The panel keeps the variant on the instance and passes it to the type when creating.
+3. **Specification** — what the administrator sells: CPU, memory, disk and price bound to
+   one type *and* one variant. Enabled specifications appear in the store as the
+   `spec` and `variant` options of that type's product.
+
+Administrators create specifications from *Administration → Instance specifications* in
+two steps: pick the type, then the variant.
 
 ### `server-instances`
 
@@ -47,6 +64,13 @@ supports Paper, Purpur, Fabric and vanilla jars (custom jars too), writes
 `server.properties` from a schema with **59 settings across five sections**
 (software and JVM, network and RCON, gameplay, world, panel runtime), gates
 starting on the Minecraft EULA, and intercepts the `eula` console command.
+
+### `shell-instance`
+
+Plain shell servers, defined by administrators rather than the plugin: create a shell
+type with an image, an install script, a run command and environment variables, then
+sell it like any other type. Instances keep `install.sh` and `run.sh` in their folder so
+the scripts stay auditable and editable.
 
 ### `file-manager`
 
