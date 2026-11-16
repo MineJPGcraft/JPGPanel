@@ -21,6 +21,64 @@ export type { InstanceRuntime, TerminalLine } from "./runtime.js";
 export type InstancePowerState = "running" | "stopped" | "starting" | "stopping" | "failed";
 export type InstanceHealth = "unknown" | "healthy" | "unhealthy";
 
+/**
+ * A configuration field of an instance type, described as a subset of JSON Schema.
+ * The panel renders it and writes the result to the instance's config file, so a type
+ * can expose exactly the knobs its server software has.
+ */
+export type InstanceConfigField =
+  | { type: "string"; title?: string; description?: string; default?: string; minLength?: number; maxLength?: number; pattern?: string; format?: "password" | "path" | "multiline" }
+  | { type: "number" | "integer"; title?: string; description?: string; default?: number; minimum?: number; maximum?: number; step?: number }
+  | { type: "boolean"; title?: string; description?: string; default?: boolean }
+  | { type: "enum"; title?: string; description?: string; default?: string; values: Array<{ value: string; title?: string; description?: string }> }
+  | { type: "array"; title?: string; description?: string; items: InstanceConfigField; minItems?: number; maxItems?: number };
+
+/** A group of fields, for example "Gameplay" or "Network". */
+export interface InstanceConfigSection {
+  id: string;
+  title: string;
+  description?: string;
+  fields: Record<string, InstanceConfigField>;
+}
+
+/** The full configuration description of an instance type. */
+export interface InstanceConfigSchema {
+  /** Bumped by the type whenever fields change; stored configs are merged on read. */
+  version: number;
+  sections: InstanceConfigSection[];
+}
+
+export type InstanceConfigValues = Record<string, string | number | boolean>;
+
+/** A file an instance type writes or manages, exposed through the file manager. */
+export interface InstanceFileTrack {
+  /** Path relative to the instance directory. */
+  path: string;
+  title: string;
+  /** Config file tracked by the configuration panel. */
+  config?: boolean;
+  /** Editable in the file manager. */
+  writable?: boolean;
+  language?: "json" | "properties" | "yaml" | "toml" | "ini" | "text";
+}
+
+/** A remote or bundled download the type can list (server jars, mods, plugins). */
+export interface InstanceRemoteFile {
+  name: string;
+  url: string;
+  size?: number;
+  description?: string;
+  /** Version label shown in the picker. */
+  version?: string;
+}
+
+export interface InstanceDownloadSource {
+  id: string;
+  title: string;
+  /** Resolve the list of files for this instance; may call the upstream API. */
+  list(instance: Instance): Promise<InstanceRemoteFile[]>;
+}
+
 /** A value the buyer picks before an instance of the type is created. */
 export interface InstanceOption {
   key: string;
@@ -56,6 +114,8 @@ export interface InstanceCreateRequest {
   project: { id: number; name: string };
   /** Values validated against the offer options. */
   selections: Record<string, string | number | boolean>;
+  /** Configuration values pre-filled at purchase time (server edition, version, port …). */
+  config: InstanceConfigValues;
   spec: { cpu: number; memoryMb: number; diskGb?: number };
   /** Identifier of this purchase line, stable across retries. */
   orderKey: string;
@@ -100,6 +160,16 @@ export interface InstanceTypeDefinition {
   description?: string;
   pluginId: string;
   offer: InstanceTypeOffer;
+  /** Every knob the panel lets the owner tune; stored per instance. */
+  configSchema: InstanceConfigSchema;
+  /** Files the panel shows in the file manager, relative to the instance directory. */
+  files?: InstanceFileTrack[];
+  /** Download sources offered next to the file manager. */
+  downloads?: InstanceDownloadSource[];
+  /** Called when the owner saves the configuration; the type writes its files. */
+  applyConfig?(instance: Instance, values: InstanceConfigValues, provisioner: InstanceProvisioner): Promise<void>;
+  /** Human readable summary shown on the instance overview, e.g. edition and version. */
+  describe?(instance: Instance, values: InstanceConfigValues): string;
   /** Create the backing instance. Must be idempotent for the same `orderKey`. */
   create(request: InstanceCreateRequest, provisioner: InstanceProvisioner): Promise<InstanceCreation>;
   /** Start the instance; the type decides which process runs. */
@@ -113,12 +183,18 @@ export interface InstanceTypeDefinition {
     method: "GET" | "POST" | "PUT" | "DELETE";
     /** Path relative to /api/instances/:id/type, for example `world`. */
     path: string;
-    handle(session: Session, user: User, instance: Instance, body: Record<string, unknown>, query: URLSearchParams): Promise<void>;
+    handle(session: Session, user: User, instance: Instance, body: Record<string, unknown>, query: URLSearchParams, provisioner: InstanceProvisioner): Promise<void>;
   }>;
+  /**
+   * Console commands the panel intercepts instead of forwarding, for example `backup`
+   * or `whitelist add`. Return `false` to forward the line to the process.
+   */
+  commands?: Array<{ name: string; description: string; run(instance: Instance, argument: string, user: User, provisioner: InstanceProvisioner): Promise<string | undefined> }>;
 }
 
-export interface InstanceTypeView extends Omit<InstanceTypeDefinition, "create" | "destroy" | "onPower" | "routes"> {
+export interface InstanceTypeView extends Omit<InstanceTypeDefinition, "create" | "destroy" | "onPower" | "routes" | "applyConfig" | "describe" | "downloads"> {
   routeCount: number;
+  downloadSources: Array<{ id: string; title: string }>;
   /** Specs the administrator published for this type. */
   specs: InstanceSpecView[];
 }
@@ -160,6 +236,7 @@ export interface InstanceRow {
   disk_gb: number;
   port: number;
   attributes_json: string;
+  config_json: string;
   order_id: string;
   last_error: string;
   started_at: string;
@@ -170,6 +247,7 @@ export interface InstanceRow {
 
 export interface Instance extends InstanceRow {
   attributes: Record<string, unknown>;
+  config: InstanceConfigValues;
   spec?: InstanceSpec;
 }
 
@@ -210,6 +288,10 @@ export interface InstanceService {
   /** Resolve an instance the user may access, writing the error response when not. */
   authorize(session: Session, instanceId: string, admin?: boolean): Promise<Instance | undefined>;
   events(instanceId: string, limit?: number): Promise<InstanceEventRow[]>;
+  /** Current configuration merged over the schema defaults. */
+  config(instanceId: string): Promise<{ schema: InstanceConfigSchema; values: InstanceConfigValues } | undefined>;
+  /** Validate and store configuration, then let the type write its files. */
+  saveConfig(instanceId: string, patch: InstanceConfigValues, actor?: User): Promise<InstanceConfigValues>;
   recordEvent(instanceId: string, type: InstanceEventType, message: string, actor?: User): Promise<void>;
 }
 

@@ -3,7 +3,8 @@ import { Link, useParams } from "react-router-dom";
 import { Badge, Button, Input, LinkButton, api, useI18n } from "@mirelia/dashboard/frontend";
 import { ArrowLeft, CircleDot, LoaderCircle, Play, Send, Server, Square, Terminal, Trash2 } from "lucide-react";
 import type { InstanceItem, InstanceType } from "./InstancesPage";
-import { InstanceTypePanels, MinecraftPanel } from "../panels";
+import { InstanceFileSlot, InstanceTypePanels, MinecraftPanel } from "../panels";
+import InstanceConfigPanel from "./InstanceConfigPanel";
 
 interface ConsoleLine { seq: number; stream: "stdout" | "stderr" | "system"; text: string; at: string }
 interface EventRow { id: number; event_type: string; message: string; created_at: string }
@@ -84,8 +85,10 @@ export default function InstanceDetailPage() {
     </div>
     {error && <p role="alert" className="mt-4 text-sm text-destructive">{error}</p>}
     {!payload ? <p role="status" className="mt-6 flex items-center gap-2 text-sm text-muted-foreground"><LoaderCircle className="size-4 animate-spin" />{t("cloud.common.loading")}</p> : <div className="mt-6 grid gap-6 lg:grid-cols-[minmax(0,1fr)_18rem]">
+      {payload.type && <InstanceConfigPanel instanceId={payload.instance.instance_id} schema={payload.type.configSchema} values={payload.instance.config} />}
       {payload.type?.id === "minecraft" && <MinecraftPanel instanceId={payload.instance.instance_id} />}
       <InstanceTypePanels typeId={payload.type?.id ?? ""} instanceId={payload.instance.instance_id} />
+      <InstanceFileSlot instanceId={payload.instance.instance_id} />
       <section className="min-w-0">
         <div className="mb-2 flex items-center justify-between gap-3">
           <h2 className="flex items-center gap-2 text-sm font-semibold"><Terminal className="size-4 text-muted-foreground" />{t("cloud.instances.detail.console")}</h2>

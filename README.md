@@ -7,8 +7,10 @@ can be versioned and deployed independently of the cloud core.
 ## Packages
 
 ```text
-server-instances  instance framework: types, specs, lifecycle, console, store integration
-mc-instance       reference instance type: Minecraft servers
+server-instances  instance framework: types, specs, lifecycle, console, configuration, store integration
+mc-instance       reference instance type: Minecraft servers (MCSM-scale configuration)
+file-manager      file browser/editor, uploads and backups for every instance
+backup            scheduled backups driven by each type's autoBackupHours setting
 ```
 
 ### `server-instances`
@@ -29,17 +31,34 @@ The framework owns everything that is the same for every kind of server:
 * **Lifecycle and console** — start/stop run a supervised process owned by the
   instance type; stdout/stderr are kept in a bounded buffer and streamed to the
   browser over server-sent events, and console commands are written to stdin.
+* **Configuration schema** — an instance type describes every knob as a JSON-Schema
+  subset (`configSchema`). The panel renders the form generically, validates and merges
+  values over defaults, stores them per instance and calls the type's `applyConfig`
+  to write the files. Types may also intercept console commands and mount extra routes.
+* **Files and downloads** — types declare the files they manage and remote sources
+  (server jars, mods, plugins) the panel can fetch.
 * **Activity log** — every create, configure, start and stop is recorded and shown
   on the instance page.
 
 ### `mc-instance`
 
-A reference instance type that sells Minecraft servers. It downloads the Paper,
-Fabric or vanilla server jar, writes `server.properties`, gates starting on the
-Minecraft EULA, and adds a quick-configuration panel (MOTD, player limit,
-difficulty, view distance, online mode, PvP, memory) that writes straight to
-`server.properties`. When the selected server software is unavailable for the
-requested version it falls back to the official vanilla jar.
+A reference instance type that sells Minecraft servers, modelled on MCSM. It
+supports Paper, Purpur, Fabric and vanilla jars (custom jars too), writes
+`server.properties` from a schema with **59 settings across five sections**
+(software and JVM, network and RCON, gameplay, world, panel runtime), gates
+starting on the Minecraft EULA, and intercepts the `eula` console command.
+
+### `file-manager`
+
+Browser for the instance directory with folder creation, upload, rename, delete and
+an editor for managed files. It also creates `tar.gz` backups (excluding backups
+themselves), restores them after snapshotting the current state, and keeps the last
+`backupKeep` archives.
+
+### `backup`
+
+Schedules backups: every `intervalMinutes` it looks for instances whose
+`autoBackupHours` is set and asks the file manager to archive them.
 
 ## Configuration
 

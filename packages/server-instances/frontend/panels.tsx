@@ -9,6 +9,13 @@ export function InstanceTypePanels({ typeId, instanceId }: { typeId: string; ins
   return <>{panels.map(({ id, component: Panel }) => <Panel key={id} {...({ instanceId } as never)} />)}</>;
 }
 
+/** File manager and other tools contributed by plugins for every instance. */
+export function InstanceFileSlot({ instanceId }: { instanceId: string }) {
+  const panels = useSlot("instance:files");
+  if (!panels.length) return null;
+  return <>{panels.map(({ id, component: Panel }) => <Panel key={id} {...({ instanceId } as never)} />)}</>;
+}
+
 export type { InstancePanelProps };
 
 /** Built-in reference panel for the `minecraft` type shipped by mc-instance. */

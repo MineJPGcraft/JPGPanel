@@ -13,17 +13,23 @@ import {
   config as contractConfig, depend, provide,
   type Instance, type InstanceConfig, type InstanceCreation, type InstanceEventRow, type InstanceEventType,
   type InstanceOption, type InstancePowerState, type InstanceProvisioner, type InstanceRow, type InstanceService,
-  type InstanceSpec, type InstanceSpecView, type InstanceTypeDefinition, type InstanceTypeView,
+  type InstanceSpec, type InstanceSpecView, type InstanceConfigSchema, type InstanceConfigValues,
+  type InstanceTypeDefinition, type InstanceTypeView,
 } from "./contract.js";
-import { InstanceRuntime } from "./runtime.js";
+import {
+  InstanceRuntime, existsSync, fileSize, listFiles, mkdirSync, readFileSync, safePath, statSync, writeFileSync,
+} from "./runtime.js";
+import { applyPatch, ConfigError, mergeConfig } from "./config.js";
 
 export { depend, provide };
 export const config: Schema<InstanceConfig> = contractConfig;
 export type {
   Instance, InstanceConfig, InstanceCreation, InstanceEventRow, InstanceEventType, InstanceOption, InstancePowerState,
   InstanceCreateRequest, InstanceProvisioner, InstanceRow, InstanceService, InstanceSpec, InstanceSpecView,
-  InstanceTypeDefinition, InstanceTypeOffer, InstanceTypeView, TerminalLine,
+  InstanceConfigField, InstanceConfigSchema, InstanceConfigSection, InstanceConfigValues, InstanceFileTrack,
+  InstanceDownloadSource, InstanceRemoteFile, InstanceTypeDefinition, InstanceTypeOffer, InstanceTypeView, TerminalLine,
 } from "./contract.js";
+export { mergeConfig, schemaDefaults } from "./config.js";
 export type { InstanceRuntime } from "./runtime.js";
 
 const logger = new Logger("server-instances");
@@ -37,14 +43,16 @@ function defaultRuntime(): InstanceConfig { return { publicUrl: "http://localhos
 function publicType(type: InstanceTypeDefinition, specs: InstanceSpecView[]): InstanceTypeView {
   return {
     id: type.id, name: type.name, description: type.description, pluginId: type.pluginId, offer: type.offer,
+    configSchema: type.configSchema, files: type.files ?? [],
+    downloadSources: (type.downloads ?? []).map((source) => ({ id: source.id, title: source.title })),
     routeCount: type.routes?.length ?? 0, specs,
   };
 }
 
-function decorate(row: InstanceRow, spec?: InstanceSpec): Instance {
+function decorate(row: InstanceRow, spec?: InstanceSpec, config: InstanceConfigValues = {}): Instance {
   let attributes: Record<string, unknown> = {};
   try { const parsed = JSON.parse(row.attributes_json || "{}"); attributes = object(parsed); } catch { attributes = {}; }
-  return { ...row, attributes, spec };
+  return { ...row, attributes, config, spec };
 }
 
 export async function apply(ctx: Context, pluginConfig: InstanceConfig = defaultRuntime()) {
@@ -76,6 +84,7 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
     disk_gb: { type: "integer", initial: 10, nullable: false },
     port: { type: "integer", initial: 0, nullable: false },
     attributes_json: { type: "text", initial: "{}", nullable: false },
+    config_json: { type: "text", initial: "{}", nullable: false },
     order_id: { type: "string", initial: "", nullable: false },
     last_error: { type: "string", initial: "", nullable: false },
     started_at: { type: "timestamp", initial: "", nullable: false },
@@ -203,6 +212,21 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
     }
   }
 
+  function typeOf(row: InstanceRow) { return types.get(row.type_id); }
+
+  function parseConfig(row: InstanceRow): InstanceConfigValues {
+    try {
+      const parsed = JSON.parse(row.config_json || "{}");
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as InstanceConfigValues : {};
+    } catch { return {}; }
+  }
+
+  /** Stored configuration merged over the type's schema defaults. */
+  async function storedConfig(row: InstanceRow) {
+    const definition = typeOf(row);
+    return definition ? mergeConfig(definition.configSchema, parseConfig(row)) : parseConfig(row);
+  }
+
   const service: InstanceService = {
     registerType(definition) {
       const id = String(definition.id ?? "").trim().toLowerCase();
@@ -282,7 +306,8 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
         instance_id: instanceId, tenant_id: request.tenantId, project_id: request.project.id, owner_user_id: request.user.id!,
         spec_id: spec.id!, type_id: spec.type_id, plugin_id: definition.pluginId, name: `${definition.name} ${instanceId.slice(-4)}`,
         provider_ref: "", status: "starting", health: "unknown", cpu: spec.cpu, memory_mb: spec.memory_mb, disk_gb: spec.disk_gb,
-        port: 0, attributes_json: JSON.stringify({ selections: request.selections }), order_id: request.orderKey,
+        port: 0, attributes_json: JSON.stringify({ selections: request.selections }),
+        config_json: JSON.stringify(mergeConfig(definition.configSchema, request.config)), order_id: request.orderKey,
         last_error: "", started_at: "", stopped_at: "", created_at: now, updated_at: now,
       }) as InstanceRow;
       await service.recordEvent(instanceId, "created", `created ${definition.name} with spec ${spec.name}`, request.user);
@@ -309,18 +334,20 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
       const spec = row.spec_id ? await db.selectOne("instance_specs", { id: row.spec_id }) as InstanceSpec | undefined : undefined;
       const runtime = runtimes.get(instanceId);
       const status: InstancePowerState = runtime?.running ? "running" : (row.status === "running" ? "stopped" : row.status);
-      return decorate({ ...row, status }, spec);
+      return decorate({ ...row, status }, spec, await storedConfig(row));
     },
 
     async listForUser(user) {
       if (user.id === undefined) return [];
-      const rows = await db.select("instances", { owner_user_id: user.id }) as InstanceRow[];
+      const rows = (await db.select("instances", { owner_user_id: user.id }) as InstanceRow[]).sort((a, b) => b.created_at.localeCompare(a.created_at));
       const specsById = new Map((await specs()).map((spec) => [spec.id, spec]));
-      return rows.sort((a, b) => b.created_at.localeCompare(a.created_at)).map((row) => {
+      const output: Instance[] = [];
+      for (const row of rows) {
         const runtime = runtimes.get(row.instance_id);
         const status: InstancePowerState = runtime?.running ? "running" : (row.status === "running" ? "stopped" : row.status);
-        return decorate({ ...row, status }, row.spec_id ? specsById.get(row.spec_id) : undefined);
-      });
+        output.push(decorate({ ...row, status }, row.spec_id ? specsById.get(row.spec_id) : undefined, await storedConfig(row)));
+      }
+      return output;
     },
 
     async authorize(session, instanceId, admin = false) {
@@ -333,6 +360,27 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
       if (access?.project.id) return instance;
       session.status = 404; session.respond({ error: session.text("instances.errors.notFound") }, "json");
       return undefined;
+    },
+
+    async config(instanceId) {
+      const row = await db.selectOne("instances", { instance_id: instanceId }) as InstanceRow | undefined;
+      const definition = row ? typeOf(row) : undefined;
+      if (!row || !definition) return undefined;
+      return { schema: definition.configSchema, values: mergeConfig(definition.configSchema, parseConfig(row)) };
+    },
+
+    async saveConfig(instanceId, patch, actor) {
+      const row = await db.selectOne("instances", { instance_id: instanceId }) as InstanceRow | undefined;
+      const definition = row ? typeOf(row) : undefined;
+      if (!row || !definition) throw new Error("instance_missing");
+      const next = applyPatch(definition.configSchema, mergeConfig(definition.configSchema, parseConfig(row)), patch);
+      await db.update("instances", { id: row.id }, { config_json: JSON.stringify(next), updated_at: new Date().toISOString() });
+      if (definition.applyConfig) {
+        const instance = decorate({ ...row, config_json: JSON.stringify(next) }, undefined, next);
+        await definition.applyConfig(instance, next, provisionerFor(row));
+      }
+      await service.recordEvent(instanceId, "configured", `configuration saved by ${actor?.username ?? "system"}`, actor);
+      return next;
     },
 
     async events(instanceId, limit = 50) {
@@ -404,7 +452,7 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
       selections[option.key] = option.type === "number" ? Number(raw) : option.type === "boolean" ? raw === "true" : raw;
     }
     const instance = await service.createInstanceForOrder({
-      user: request.user, tenantId: request.tenant.id!, project: request.project, selections,
+      user: request.user, tenantId: request.tenant.id!, project: request.project, selections, config: selections,
       specId, spec: { cpu: spec.cpu, memoryMb: spec.memory_mb, diskGb: spec.disk_gb }, orderKey: request.idempotencyKey,
     });
     return {
@@ -464,6 +512,107 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
     }
   });
 
+  /** Configuration of the instance, merged over the type's schema defaults. */
+  ctx.route("/api/instances/:id/config").methods("GET").action(async (session, _query, id) => {
+    const instance = await service.authorize(session, id);
+    if (!instance) return;
+    const config = await service.config(id);
+    if (!config) return fail(session, 404, "instances.errors.notFound");
+    session.respond({ ...config, summary: typeOf(instance as InstanceRow)?.describe?.(instance, config.values) ?? "" }, "json");
+  });
+
+  ctx.route("/api/instances/:id/config").methods("PUT").action(async (session, _query, id) => {
+    const instance = await service.authorize(session, id);
+    if (!instance) return;
+    const user = await users.current(session);
+    const patch = object(await session.parseRequestBody());
+    try {
+      const values = await service.saveConfig(id, patch as InstanceConfigValues, user);
+      session.respond({ values, summary: typeOf(instance as InstanceRow)?.describe?.(instance, values) ?? "" }, "json");
+    } catch (error) {
+      if (error instanceof ConfigError) { fail(session, 400, "instances.errors.config", { issues: error.issues }); return; }
+      fail(session, 400, "instances.errors.config", { detail: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  /** Files the instance type tracks, shown in the file manager. */
+  ctx.route("/api/instances/:id/files").methods("GET").action(async (session, query, id) => {
+    const instance = await service.authorize(session, id);
+    if (!instance) return;
+    const definition = typeOf(instance as InstanceRow);
+    if (!definition) return fail(session, 404, "instances.errors.notFound");
+    const requested = query.get("path");
+    const directory = path.join(root, instance.instance_id);
+    if (!requested) {
+      const tracked = (definition.files ?? []).map((file) => ({
+        ...file, exists: existsSync(path.join(directory, file.path)), size: fileSize(path.join(directory, file.path)),
+      }));
+      const entries = listFiles(directory).slice(0, 200);
+      session.respond({ tracked, entries }, "json");
+      return;
+    }
+    const resolved = safePath(directory, requested);
+    if (!resolved) return fail(session, 400, "instances.errors.file");
+    if (!existsSync(resolved) || statSync(resolved).isDirectory()) return fail(session, 404, "instances.errors.file");
+    if (statSync(resolved).size > 2 * 1024 * 1024) return fail(session, 413, "instances.errors.fileTooLarge");
+    session.respond({ path: requested, content: readFileSync(resolved, "utf8"), size: statSync(resolved).size }, "json");
+  });
+
+  ctx.route("/api/instances/:id/files").methods("PUT").action(async (session, _query, id) => {
+    const instance = await service.authorize(session, id);
+    if (!instance) return;
+    const definition = typeOf(instance as InstanceRow);
+    const body = object(await session.parseRequestBody());
+    const requested = String(body.path ?? "");
+    const tracked = definition?.files?.find((file) => file.path === requested);
+    if (!tracked?.writable) return fail(session, 403, "instances.errors.fileReadOnly");
+    const directory = path.join(root, instance.instance_id);
+    const resolved = safePath(directory, requested);
+    if (!resolved) return fail(session, 400, "instances.errors.file");
+    mkdirSync(path.dirname(resolved), { recursive: true });
+    writeFileSync(resolved, String(body.content ?? "").slice(0, 2 * 1024 * 1024));
+    await service.recordEvent(id, "configured", `edited ${requested}`, await users.current(session));
+    session.respond({ ok: true, size: statSync(resolved).size }, "json");
+  });
+
+  /** Remote files (server jars, mods, plugins) the type can list and download. */
+  ctx.route("/api/instances/:id/downloads").methods("GET").action(async (session, query, id) => {
+    const instance = await service.authorize(session, id);
+    if (!instance) return;
+    const definition = typeOf(instance as InstanceRow);
+    const source = definition?.downloads?.find((entry) => entry.id === query.get("source"));
+    if (!source) return fail(session, 404, "instances.errors.notFound");
+    try { session.respond({ files: await source.list(instance) }, "json"); }
+    catch (error) { fail(session, 502, "instances.errors.download", { detail: error instanceof Error ? error.message : String(error) }); }
+  });
+
+  ctx.route("/api/instances/:id/downloads").methods("POST").action(async (session, _query, id) => {
+    const instance = await service.authorize(session, id);
+    if (!instance) return;
+    const definition = typeOf(instance as InstanceRow);
+    const body = object(await session.parseRequestBody());
+    const source = definition?.downloads?.find((entry) => entry.id === body.source);
+    if (!source) return fail(session, 404, "instances.errors.notFound");
+    try {
+      const files = await source.list(instance);
+      const selected = files.find((file) => file.name === body.name);
+      if (!selected) return fail(session, 404, "instances.errors.file");
+      const row = await db.selectOne("instances", { instance_id: id }) as InstanceRow;
+      const provisioner = provisionerFor(row);
+      provisioner.runtime.pushLine("system", `downloading ${selected.name}`);
+      const response = await fetch(selected.url);
+      if (!response.ok) throw new Error(`download failed (${response.status})`);
+      const target = safePath(path.join(root, id), String(body.target ?? `server/${selected.name}`).replace(/^\/+/, ""));
+      if (!target) throw new Error("invalid target path");
+      mkdirSync(path.dirname(target), { recursive: true });
+      writeFileSync(target, Buffer.from(await response.arrayBuffer()));
+      await service.recordEvent(id, "configured", `downloaded ${selected.name}`, await users.current(session));
+      session.respond({ ok: true, name: selected.name }, "json");
+    } catch (error) {
+      fail(session, 502, "instances.errors.download", { detail: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
   ctx.route("/api/instances/:id/terminal").methods("POST").action(async (session, _query, id) => {
     const instance = await service.authorize(session, id);
     if (!instance) return;
@@ -471,6 +620,23 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
     const command = String(body.command ?? "").trim();
     if (!command) return fail(session, 400, "instances.errors.action");
     const runtime = runtimeFor(instance);
+    const definition = typeOf(instance as InstanceRow);
+    const [name, ...rest] = command.split(/\s+/);
+    const interceptor = definition?.commands?.find((entry) => entry.name === name.toLowerCase());
+    const user = await users.current(session);
+    if (interceptor && user) {
+      // Instance types may answer console commands themselves (backup, whitelist …).
+      try {
+        const output = await interceptor.run(instance, rest.join(" "), user, provisionerFor(await db.selectOne("instances", { instance_id: id }) as InstanceRow));
+        runtime.pushLine("system", `> ${command}`);
+        if (output) runtime.pushLine("system", output);
+        session.respond({ ok: true, handled: true, output: output ?? "" }, "json");
+        return;
+      } catch (error) {
+        fail(session, 409, "instances.errors.command", { detail: error instanceof Error ? error.message : String(error) });
+        return;
+      }
+    }
     try {
       runtime.write(command.slice(0, 2000));
       session.respond({ ok: true }, "json");
@@ -550,7 +716,8 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
         const user = await users.current(session);
         if (!user) return fail(session, 401, "instances.errors.auth");
         const body = route.method === "GET" || route.method === "DELETE" ? {} : object(await session.parseRequestBody());
-        await route.handle(session, user, instance, body, query);
+        const row = await db.selectOne("instances", { instance_id: instance.instance_id }) as InstanceRow;
+        await route.handle(session, user, instance, body, query, provisionerFor(row));
       });
     }
   }
@@ -619,8 +786,41 @@ export async function apply(ctx: Context, pluginConfig: InstanceConfig = default
       saved: { zh: "规格已保存", en: "Specification saved", ja: "仕様を保存しました" },
       instancesTitle: { zh: "全部实例", en: "All instances", ja: "すべてのインスタンス" },
     },
+    config: {
+      title: { zh: "配置", en: "Configuration", ja: "設定" },
+      changed: { zh: "已修改", en: "Changed", ja: "変更あり" },
+      description: { zh: "保存后会写入实例配置，重启服务器后生效。", en: "Saving writes the instance configuration; restart the server to apply it.", ja: "保存すると設定が書き込まれます。再起動で反映されます。" },
+      save: { zh: "保存配置", en: "Save configuration", ja: "設定を保存" },
+      saved: { zh: "配置已保存", en: "Configuration saved", ja: "設定を保存しました" },
+      search: { zh: "搜索配置项", en: "Search settings", ja: "設定を検索" },
+    },
+    files: {
+      title: { zh: "文件", en: "Files", ja: "ファイル" },
+      description: { zh: "实例目录中的文件。受管文件可直接编辑。", en: "Files inside the instance directory. Managed files are editable.", ja: "インスタンスディレクトリ内のファイルです。管理対象ファイルは編集できます。" },
+      tracked: { zh: "受管文件", en: "Managed files", ja: "管理対象ファイル" },
+      missing: { zh: "未生成", en: "Not created yet", ja: "未生成" },
+      empty: { zh: "目录为空", en: "The directory is empty", ja: "ディレクトリは空です" },
+      save: { zh: "保存文件", en: "Save file", ja: "ファイルを保存" },
+      saved: { zh: "文件已保存", en: "File saved", ja: "ファイルを保存しました" },
+      readOnly: { zh: "该文件为只读", en: "This file is read-only", ja: "このファイルは読み取り専用です" },
+      tooLarge: { zh: "文件过大，无法在面板中编辑", en: "The file is too large to edit in the panel", ja: "ファイルが大きすぎて編集できません" },
+    },
+    downloads: {
+      title: { zh: "下载", en: "Downloads", ja: "ダウンロード" },
+      description: { zh: "从上游获取服务端、模组或插件文件。", en: "Fetch server, mod or plugin files from upstream.", ja: "サーバー、MOD、プラグインを取得します。" },
+      install: { zh: "下载到实例", en: "Download", ja: "ダウンロード" },
+      installing: { zh: "正在下载…", en: "Downloading…", ja: "ダウンロード中…" },
+      empty: { zh: "没有可下载的文件", en: "No files available", ja: "ダウンロードできるファイルはありません" },
+      done: { zh: "下载完成", en: "Download complete", ja: "ダウンロード完了" },
+    },
     errors: {
       auth: { zh: "请先登录", en: "Authentication is required", ja: "ログインしてください" },
+      config: { zh: "配置无效", en: "Invalid configuration", ja: "設定が無効です" },
+      file: { zh: "文件不存在或路径无效", en: "The file does not exist or the path is invalid", ja: "ファイルが存在しないかパスが無効です" },
+      fileReadOnly: { zh: "该文件不允许在面板中修改", en: "This file cannot be edited in the panel", ja: "このファイルはパネルから変更できません" },
+      fileTooLarge: { zh: "文件过大", en: "The file is too large", ja: "ファイルが大きすぎます" },
+      download: { zh: "下载失败", en: "The download failed", ja: "ダウンロードに失敗しました" },
+      command: { zh: "命令执行失败", en: "The command failed", ja: "コマンドの実行に失敗しました" },
       notFound: { zh: "实例不存在或无权访问", en: "Instance not found or access denied", ja: "インスタンスが存在しないか権限がありません" },
       action: { zh: "请求无效", en: "Invalid request", ja: "リクエストが無効です" },
       power: { zh: "实例操作失败", en: "The instance operation failed", ja: "インスタンス操作に失敗しました" },

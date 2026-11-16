@@ -1,5 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 export interface TerminalLine {
@@ -128,3 +128,25 @@ export function ensureDirectory(directory: string) {
 export function removeDirectory(directory: string) {
   rmSync(directory, { recursive: true, force: true });
 }
+
+/** Resolve a path inside `root`, refusing anything that escapes it. */
+export function safePath(root: string, relative: string) {
+  const resolved = path.resolve(root, relative.replace(/^\/+/, ""));
+  const base = path.resolve(root);
+  return resolved === base || resolved.startsWith(`${base}${path.sep}`) ? resolved : undefined;
+}
+
+/** File size, or 0 when the path does not exist. */
+export function fileSize(file: string) {
+  try { return statSync(file).size; } catch { return 0; }
+}
+
+/** Shallow listing of a directory, largest files first. */
+export function listFiles(directory: string) {
+  if (!existsSync(directory)) return [];
+  return readdirSync(directory, { withFileTypes: true })
+    .map((entry) => ({ name: entry.name, directory: entry.isDirectory(), size: entry.isDirectory() ? 0 : fileSize(path.join(directory, entry.name)) }))
+    .sort((a, b) => Number(b.directory) - Number(a.directory) || b.size - a.size);
+}
+
+export { readFileSync, writeFileSync, existsSync, mkdirSync, statSync };

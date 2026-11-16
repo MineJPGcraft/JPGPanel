@@ -7,7 +7,7 @@
   "dev": "src/index.ts",
   "types": "dist/index.d.ts",
   "scripts": {
-    "build": "../../../../node_modules/.bin/tsc -p tsconfig.json && ../../../../node_modules/.bin/vite build"
+    "build": "../../../../node_modules/.bin/tsc -p tsconfig.json"
   },
   "dependencies": {
     "@jpgpanel/server-instances": "workspace:*",
@@ -15,11 +15,6 @@
   },
   "peerDependencies": {
     "yumeri": "^3.1.4"
-  },
-  "devDependencies": {
-    "@vitejs/plugin-react": "^6.0.1",
-    "react": "^19.2.6",
-    "vite": "^8.0.12"
   },
   "exports": {
     ".": {
