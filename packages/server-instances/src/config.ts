@@ -1,11 +1,11 @@
-import type { InstanceConfigField, InstanceConfigSchema, InstanceConfigValues } from "./contract.js";
+import type { ConfigField, ConfigValues } from "./contract.js";
 
 export interface ConfigIssue { field: string; message: string }
 export class ConfigError extends Error {
   constructor(readonly issues: ConfigIssue[]) { super(issues.map((issue) => `${issue.field}: ${issue.message}`).join("; ")); }
 }
 
-function coerce(field: InstanceConfigField, value: unknown): unknown {
+function coerce(field: ConfigField, value: unknown): unknown {
   switch (field.type) {
     case "boolean":
       if (typeof value === "boolean") return value;
@@ -25,7 +25,7 @@ function coerce(field: InstanceConfigField, value: unknown): unknown {
 }
 
 /** Validate one field value; returns the normalised value or a message. */
-function validateField(field: InstanceConfigField, key: string, value: unknown): { value?: unknown; issue?: ConfigIssue } {
+function validateField(field: ConfigField, key: string, value: unknown): { value?: unknown; issue?: ConfigIssue } {
   if (value === undefined || value === null || value === "") {
     if ("default" in field && field.default !== undefined) return { value: field.default };
     return { value: undefined };
@@ -71,57 +71,23 @@ function validateField(field: InstanceConfigField, key: string, value: unknown):
 }
 
 /** Defaults declared by the schema; missing parts of a stored config fall back to these. */
-export function schemaDefaults(schema: InstanceConfigSchema): InstanceConfigValues {
-  const values: InstanceConfigValues = {};
-  for (const section of schema.sections) {
-    for (const [key, field] of Object.entries(section.fields)) {
-      if ("default" in field && field.default !== undefined) values[key] = field.default;
-    }
-  }
-  return values;
+/** Validate one value against a field definition; returns the stored value. */
+export function normalize(field: ConfigField, key: string, value: unknown) {
+  const result = validateField(field, key, value);
+  return { value: result.value as string | number | boolean | undefined, issue: result.issue };
 }
 
-/**
- * Merge a stored config over the schema defaults. Unknown keys are dropped and missing
- * ones filled, so a schema that gains fields keeps older instances working.
- */
-export function mergeConfig(schema: InstanceConfigSchema, stored: InstanceConfigValues | undefined): InstanceConfigValues {
-  const merged = schemaDefaults(schema);
+/** Merge buyer/administrator values over the field defaults, dropping invalid entries. */
+export function resolveValues(fields: Record<string, ConfigField>, stored: ConfigValues | undefined): ConfigValues {
+  const output: ConfigValues = {};
+  for (const [key, field] of Object.entries(fields)) {
+    if ("default" in field && field.default !== undefined) output[key] = field.default as string | number | boolean;
+  }
   for (const [key, value] of Object.entries(stored ?? {})) {
-    const field = fieldOf(schema, key);
+    const field = fields[key];
     if (!field) continue;
     const result = validateField(field, key, value);
-    if (!result.issue && result.value !== undefined) merged[key] = result.value as string | number | boolean;
+    if (!result.issue && result.value !== undefined) output[key] = result.value as string | number | boolean;
   }
-  return merged;
-}
-
-export function fieldOf(schema: InstanceConfigSchema, key: string): InstanceConfigField | undefined {
-  for (const section of schema.sections) {
-    if (section.fields[key]) return section.fields[key];
-  }
-  return undefined;
-}
-
-/** Validate a partial update and merge it over the current values. */
-export function applyPatch(schema: InstanceConfigSchema, current: InstanceConfigValues, patch: InstanceConfigValues): InstanceConfigValues {
-  const next = { ...current };
-  const issues: ConfigIssue[] = [];
-  for (const [key, value] of Object.entries(patch)) {
-    const field = fieldOf(schema, key);
-    if (!field) continue;
-    const result = validateField(field, key, value);
-    if (result.issue) issues.push(result.issue);
-    else if (result.value !== undefined) next[key] = result.value as string | number | boolean;
-    else delete next[key];
-  }
-  if (issues.length) throw new ConfigError(issues);
-  return next;
-}
-
-/** Values acceptable as an environment variable inside the generated start script. */
-export function shellValue(value: string | number | boolean) {
-  if (typeof value === "number") return String(value);
-  if (typeof value === "boolean") return value ? "true" : "false";
-  return value.replace(/[^\w.,:/@%+-]/g, "_").slice(0, 256);
+  return output;
 }

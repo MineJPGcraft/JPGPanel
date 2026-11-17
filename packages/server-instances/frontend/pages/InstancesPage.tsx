@@ -1,15 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { Badge, Button, LinkButton, api, useI18n } from "@mirelia/dashboard/frontend";
-import { CircleDot, FolderKanban, LoaderCircle, Play, Server, ShoppingBag, Square, Terminal } from "lucide-react";
+import { CircleDot, FolderKanban, LoaderCircle, Play, Server, ShoppingBag, Square } from "lucide-react";
 
-export interface InstanceSpec { id: number; name: string; cpu: number; memory_mb: number; disk_gb: number; price_cents: number }
 export interface InstanceItem {
-  instance_id: string; name: string; type_id: string; project_id: number; projectName?: string; variant_id?: string;
-  spec_id: number; status: "running" | "stopped" | "starting" | "stopping" | "failed"; cpu: number; memory_mb: number;
-  disk_gb: number; created_at: string; last_error: string; spec?: InstanceSpec;
+  instance_id: string; name: string; type_id: string; project_id: number; projectName?: string;
+  preset_id: number; spec_id: number; status: "creating" | "running" | "stopped" | "failed" | "removed";
+  cpu: number; memory_mb: number; disk_gb: number; ports: Array<{ name: string; host: number; container: number; protocol: string }>;
+  created_at: string; last_error: string; preset?: { name: string; image: string; tagline: string }; spec?: { name: string };
 }
-export interface InstanceType { id: string; name: string; description?: string; tagline?: string; pluginId: string; routeCount: number; offer: { options?: Array<{ key: string; label: string }> } }
 
 export function formatMoney(language: string, cents: number) {
   return new Intl.NumberFormat(language === "zh" ? "zh-CN" : language === "ja" ? "ja-JP" : "en-US", { style: "currency", currency: "CNY" }).format(cents / 100);
@@ -19,26 +18,22 @@ export function formatMoney(language: string, cents: number) {
 export default function InstancesPage() {
   const { t, language } = useI18n();
   const [instances, setInstances] = useState<InstanceItem[]>([]);
-  const [types, setTypes] = useState<InstanceType[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string>();
   const [error, setError] = useState("");
   const load = useCallback(async () => {
     setError("");
-    try {
-      const { data } = await api.get<{ instances: InstanceItem[]; types: InstanceType[] }>("/instances");
-      setInstances(data.instances); setTypes(data.types);
-    } catch (cause) { setError(cause instanceof Error ? cause.message : t("cloud.instances.errors.auth")); }
+    try { const { data } = await api.get<{ instances: InstanceItem[] }>("/instances"); setInstances(data.instances); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : t("cloud.instances.errors.auth")); }
     finally { setLoading(false); }
   }, [t]);
   useEffect(() => { void load(); }, [load]);
   async function power(instance: InstanceItem, action: "start" | "stop") {
     setBusy(instance.instance_id); setError("");
     try { await api.post(`/instances/${instance.instance_id}/power`, { action }); await load(); }
-    catch (cause) { setError(cause instanceof Error ? cause.message : t("cloud.instances.errors.power")); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : t("cloud.instances.errors.boot")); }
     finally { setBusy(undefined); }
   }
-  const typeName = (id: string) => types.find((type) => type.id === id)?.name ?? id;
   const groups = useMemo(() => {
     const map = new Map<number, { name: string; items: InstanceItem[] }>();
     for (const instance of instances) {
@@ -68,9 +63,10 @@ export default function InstancesPage() {
               <div className="flex flex-wrap items-center gap-2">
                 <Link to={`/instances/${instance.instance_id}`} className="font-medium hover:underline">{instance.name}</Link>
                 <Badge variant={instance.status === "running" ? "secondary" : instance.status === "failed" ? "destructive" : "outline"}><CircleDot className="size-3" />{t(`cloud.instances.status.${instance.status}`)}</Badge>
-                <Badge variant="ghost">{typeName(instance.type_id)}</Badge>
+                {instance.preset && <Badge variant="ghost">{instance.preset.name}</Badge>}
               </div>
               <p className="mt-1 text-xs text-muted-foreground">{instance.spec?.name ?? `${instance.cpu} vCPU · ${instance.memory_mb} MB`} · {instance.cpu} vCPU · {instance.memory_mb} MB{instance.disk_gb ? ` · ${instance.disk_gb} GB` : ""}</p>
+              {instance.ports.length > 0 && <p className="text-xs text-muted-foreground">{instance.ports.map((port) => `${port.name}:${port.host}`).join(" · ")}</p>}
               <p className="text-xs text-muted-foreground">{t("cloud.instances.created")} {new Date(instance.created_at).toLocaleString(language)}</p>
               {instance.last_error && <p className="text-xs text-destructive">{t("cloud.instances.detail.lastError")}: {instance.last_error}</p>}
             </div>
@@ -78,8 +74,7 @@ export default function InstancesPage() {
           <div className="flex flex-wrap items-center gap-2">
             {instance.status === "running"
               ? <Button size="sm" variant="outline" isDisabled={busy === instance.instance_id} onPress={() => void power(instance, "stop")}>{busy === instance.instance_id ? <LoaderCircle className="animate-spin" /> : <Square />}{t("cloud.instances.stop")}</Button>
-              : <Button size="sm" isDisabled={busy === instance.instance_id || instance.status === "starting"} onPress={() => void power(instance, "start")}>{busy === instance.instance_id ? <LoaderCircle className="animate-spin" /> : <Play />}{t("cloud.instances.start")}</Button>}
-            <LinkButton size="sm" variant="ghost" href={`/instances/${instance.instance_id}/console`}><Terminal />{t("cloud.instances.open")}</LinkButton>
+              : <Button size="sm" isDisabled={busy === instance.instance_id || instance.status === "creating"} onPress={() => void power(instance, "start")}>{busy === instance.instance_id ? <LoaderCircle className="animate-spin" /> : <Play />}{t("cloud.instances.start")}</Button>}
           </div>
         </article>)}</div>
       </section>)}</div>

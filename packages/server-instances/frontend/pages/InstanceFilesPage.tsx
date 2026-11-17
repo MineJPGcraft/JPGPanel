@@ -1,5 +1,4 @@
-import { LoaderCircle, Folder } from "lucide-react";
-import { useI18n } from "@mirelia/dashboard/frontend";
+import { Folder, LoaderCircle, useI18n } from "@mirelia/dashboard/frontend";
 import { useInstance } from "../lib/instance";
 import { InstanceFileSlot } from "../panels";
 

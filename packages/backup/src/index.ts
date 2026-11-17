@@ -50,8 +50,9 @@ export async function apply(ctx: Context, pluginConfig: BackupConfig = { interva
     const rows = await db.select("instances", {}) as Array<{ instance_id: string; type_id: string; created_at: string }>;
     const due: string[] = [];
     for (const row of rows) {
-      const config = await instances.config(row.instance_id).catch(() => undefined);
-      const hours = Number(config?.values.autoBackupHours ?? 0);
+      // The interval comes from the preset's purchase/provision parameter of the same name.
+      const environment = await instances.environment(row.instance_id).catch(() => undefined);
+      const hours = Number(environment?.values.autoBackupHours ?? 0);
       if (!Number.isFinite(hours) || hours <= 0) continue;
       const previous = lastRun.get(row.instance_id) ?? 0;
       if (Date.now() - previous >= hours * 3600 * 1000) due.push(row.instance_id);

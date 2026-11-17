@@ -1,10 +1,12 @@
 import type { DashboardContext } from "@mirelia/dashboard/frontend";
-import MinecraftPanel from "./pages/MinecraftPanel";
+import PlayersPanel from "./pages/PlayersPanel";
+import SettingsPanel from "./pages/SettingsPanel";
 
 /**
- * The Minecraft panel lives on the instance's "Type tools" page: server-instances
- * renders the `instance:minecraft` slot there.
+ * Both panels render on the instance's "Type tools" page; server-instances renders the
+ * `instance:mc` slot for instances whose type is `mc`.
  */
 export default function apply(ctx: DashboardContext) {
-  ctx.slot({ slot: "instance:minecraft", id: "mc-instance-panel", component: MinecraftPanel as never, order: 10 });
+  ctx.slot({ slot: "instance:mc", id: "mc-players", component: PlayersPanel as never, order: 10 });
+  ctx.slot({ slot: "instance:mc", id: "mc-settings", component: SettingsPanel as never, order: 20 });
 }
